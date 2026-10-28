@@ -75,10 +75,11 @@ func GetMetric() Metric {
 const statisticsCollectionIntervalSec = 5
 
 type statisticWrapper struct {
-	List      []FlapSummary
-	ListPeers []PeerSummary
-	Stats     statistic
-	Sessions  int
+	List         []FlapSummary
+	ListPeers    []PeerSummary
+	ListSessions []SessionSummary
+	Stats        statistic
+	Sessions     int
 }
 type FlapSummary struct {
 	Prefix     string
@@ -103,6 +104,15 @@ type statistic struct {
 	RouteCount        uint64
 }
 
+// SessionSummary represents one BGP session's update activity for the most
+// recent collection interval. It is consumed by the per-session rate chart.
+// RateSec is the raw count observed during the (5s) collection window; the
+// frontend divides by the interval to obtain a per-second rate.
+type SessionSummary struct {
+	Label   string `json:"Label"`
+	RateSec int    `json:"RateSec"`
+}
+
 var (
 	statList     = make([]statistic, 0)
 	statListLock sync.RWMutex
@@ -121,6 +131,7 @@ func SubscribeToStats() chan statisticWrapper {
 
 var lastFlapSummaryList atomic.Pointer[[]FlapSummary]
 var lastPeerSummaryList atomic.Pointer[[]PeerSummary]
+var lastSessionSummaryList atomic.Pointer[[]SessionSummary]
 
 func statTracker(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(statisticsCollectionIntervalSec) * time.Second)
@@ -134,6 +145,7 @@ func statTracker(ctx context.Context) {
 
 		aFlap, trackedCount := analyze.GetActiveFlapList()
 		aPeer := analyze.GetPeerRates()
+		sessionRates := session.GetSessionRates()
 
 		if len(aFlap) > 100 {
 			slices.SortFunc(aFlap, func(a, b analyze.FlapEvent) int {
@@ -148,6 +160,13 @@ func statTracker(ctx context.Context) {
 			})
 			aPeer = aPeer[:30]
 		}
+
+		// Keep the per-session chart readable when there are many feeds:
+		// surface the top sessions by current interval rate and aggregate any
+		// remaining sessions into a single "others" bucket so the chart still
+		// represents the total activity without an explosion of datasets.
+		const maxSessionDatasets = 20
+		jsSessionList := buildSessionSummaryList(sessionRates, maxSessionDatasets)
 
 		jsFlapList := make([]FlapSummary, len(aFlap))
 		for i, f := range aFlap {
@@ -170,6 +189,7 @@ func statTracker(ctx context.Context) {
 
 		lastFlapSummaryList.Store(&jsFlapList)
 		lastPeerSummaryList.Store(&jsPeerList)
+		lastSessionSummaryList.Store(&jsSessionList)
 
 		newStatistic := statistic{
 			Time:              time.Now().Unix(),
@@ -182,10 +202,11 @@ func statTracker(ctx context.Context) {
 		}
 
 		newWrapper := statisticWrapper{
-			List:      jsFlapList,
-			ListPeers: jsPeerList,
-			Stats:     newStatistic,
-			Sessions:  session.GetSessionCount(),
+			List:         jsFlapList,
+			ListPeers:    jsPeerList,
+			ListSessions: jsSessionList,
+			Stats:        newStatistic,
+			Sessions:     session.GetSessionCount(),
 		}
 
 		statSubscribersLock.Lock()
@@ -206,24 +227,67 @@ func statTracker(ctx context.Context) {
 	}
 }
 
+// buildSessionSummaryList prepares the per-session rate list sent to the
+// frontend. When the number of sessions exceeds maxDatasets, the lowest-
+// rate sessions are aggregated into a single "others" bucket so the chart
+// remains readable while still representing the total activity. Sessions
+// with the same display label (e.g. duplicate hostnames) are also merged to
+// avoid presenting two visually indistinguishable stacked datasets.
+func buildSessionSummaryList(rates []session.SessionRate, maxDatasets int) []SessionSummary {
+	if len(rates) == 0 {
+		return make([]SessionSummary, 0)
+	}
+
+	// Aggregate by label so sessions sharing a hostname collapse into a
+	// single chart dataset. This matches what the viewer actually sees.
+	totals := make(map[string]int, len(rates))
+	for _, r := range rates {
+		totals[r.Label] += r.RateSec
+	}
+
+	list := make([]SessionSummary, 0, len(totals))
+	for label, rate := range totals {
+		list = append(list, SessionSummary{Label: label, RateSec: rate})
+	}
+
+	slices.SortFunc(list, func(a, b SessionSummary) int {
+		return cmp.Compare(b.RateSec, a.RateSec)
+	})
+
+	if len(list) <= maxDatasets {
+		return list
+	}
+
+	kept := list[:maxDatasets]
+	othersRate := 0
+	for _, s := range list[maxDatasets:] {
+		othersRate += s.RateSec
+	}
+	kept = append(kept, SessionSummary{Label: "others", RateSec: othersRate})
+	return kept
+}
+
 func GetStats() []statisticWrapper {
 	statListLock.RLock()
 	defer statListLock.RUnlock()
 	result := make([]statisticWrapper, len(statList))
 	for i := range statList {
 		result[i] = statisticWrapper{
-			List:      nil,
-			ListPeers: nil,
-			Stats:     statList[i],
-			Sessions:  -1,
+			List:         nil,
+			ListPeers:    nil,
+			ListSessions: nil,
+			Stats:        statList[i],
+			Sessions:     -1,
 		}
 	}
 	if len(statList) > 0 {
 		l := lastFlapSummaryList.Load()
 		p := lastPeerSummaryList.Load()
+		s := lastSessionSummaryList.Load()
 		if l != nil {
 			result[len(statList)-1].List = *l
 			result[len(statList)-1].ListPeers = *p
+			result[len(statList)-1].ListSessions = *s
 			result[len(statList)-1].Sessions = session.GetSessionCount()
 		}
 	}
@@ -244,4 +308,12 @@ func GetActivePeersSummary() []PeerSummary {
 		return make([]PeerSummary, 0)
 	}
 	return *p
+}
+
+func GetActiveSessionsSummary() []SessionSummary {
+	s := lastSessionSummaryList.Load()
+	if s == nil {
+		return make([]SessionSummary, 0)
+	}
+	return *s
 }
