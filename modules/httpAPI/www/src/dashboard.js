@@ -4,7 +4,7 @@ import {
 
 import 'chartjs-adapter-date-fns';
 import JustGage from "justgage";
-import {getRelativeTime, toTimeElapsed, truncateRouteChanges} from "./util";
+import {formatSessionRate, getRelativeTime, toTimeElapsed, truncateRouteChanges} from "./util";
 
 Chart.register(
     CategoryScale,
@@ -256,8 +256,9 @@ const liveImportChart = new Chart(
 // manages datasets dynamically as sessions come and go.
 const SESSION_CHART_MAX_POINTS = 51;
 // Deterministic color palette so the same label keeps the same color across
-// snapshots. Sized generously to cover the max-session cap enforced by the
-// backend plus headroom for the "others" bucket.
+// snapshots. Sized to cover the 20-session cap enforced by the backend.
+// "others" uses a neutral slate so it is visually distinct from any single
+// session color and reads as an aggregate rather than a real peer.
 const SESSION_CHART_PALETTE = [
     "rgba(37, 99, 235, 0.55)",   // blue
     "rgba(13, 148, 136, 0.55)",  // teal
@@ -268,7 +269,7 @@ const SESSION_CHART_PALETTE = [
     "rgba(239, 68, 68, 0.55)",   // red
     "rgba(219, 39, 119, 0.55)",  // pink
     "rgba(168, 85, 247, 0.55)",  // purple
-    "rgba(79, 70, 229, 0.55)",   // indigo
+    "rgba(79, 70, 229, 0.55)",  // indigo
     "rgba(14, 165, 233, 0.55)",  // sky
     "rgba(20, 184, 166, 0.55)",  // cyan
     "rgba(101, 163, 13, 0.55)",  // olive
@@ -278,18 +279,22 @@ const SESSION_CHART_PALETTE = [
     "rgba(124, 58, 237, 0.55)",  // violet
     "rgba(49, 46, 129, 0.55)",   // navy
     "rgba(8, 145, 178, 0.55)",   // deep-teal
-    "rgba(77, 124, 15, 0.55)",   // forest
-    "rgba(120, 53, 15, 0.55)"    // brown (used for "others")
+    "rgba(77, 124, 15, 0.55)"    // forest
 ];
+const SESSION_OTHERS_COLOR_BG = "rgba(100, 116, 139, 0.55)";  // slate-500
+const SESSION_OTHERS_COLOR_BORDER = "rgba(100, 116, 139, 1)";
 
 function colorForSessionLabel(label, index) {
     if (label === "others") {
-        return "rgba(120, 53, 15, 0.55)";
+        return SESSION_OTHERS_COLOR_BG;
     }
     return SESSION_CHART_PALETTE[index % SESSION_CHART_PALETTE.length];
 }
 
 function borderForSessionLabel(label, index) {
+    if (label === "others") {
+        return SESSION_OTHERS_COLOR_BORDER;
+    }
     const bg = colorForSessionLabel(label, index);
     // Promote alpha to ~1.0 for the line border by replacing the alpha group
     return bg.replace(/rgba\(([^)]+),\s*[\d.]+\)/, "rgba($1, 1)");
@@ -332,10 +337,21 @@ const liveSessionRateChart = new Chart(
                 legend: {
                     display: true,
                     position: "bottom",
+                    // Cap the legend height so 20+ sessions don't squeeze the
+                    // plot area. Chart.js scrolls the overflow internally.
+                    maxHeight: 80,
                     labels: {
                         boxWidth: 12,
                         boxHeight: 12,
-                        font: { size: 10 }
+                        font: { size: 10 },
+                        // Hide the legend entry for datasets that have left
+                        // (all-null data) so the legend only shows active
+                        // sessions rather than historical ghosts.
+                        filter: (item, data) => {
+                            const ds = data.datasets[item.datasetIndex];
+                            if (!ds || !ds.data) return true;
+                            return ds.data.some(v => v !== null && v !== undefined);
+                        }
                     }
                 },
                 tooltip: {
@@ -353,10 +369,18 @@ const liveSessionRateChart = new Chart(
 // lookup when updating values across stats ticks.
 const sessionDatasetIndex = new Map();
 
-// Update the per-session rate chart from a ListSessions snapshot. The chart
-// keeps 51 points (matching the other live charts) and prunes datasets whose
-// session has not been seen for the entire window so the legend does not
-// accumulate stale entries forever.
+// updateSessionRateChart ingests one ListSessions snapshot per stats tick.
+//
+// Design notes:
+// - New sessions are back-filled with null so Chart.js renders a gap rather
+//   than a fake zero-rate history (which would otherwise drag the stack
+//   baseline down for past ticks).
+// - Sessions that have left (not in this tick) get a null point so their
+//   stacked contribution disappears at the current timestamp.
+// - Departed datasets are pruned once they are entirely null (every point
+//   in the window is null) so the internal datasets array doesn't grow
+//   unbounded over a long-running session. The legend filter additionally
+//   hides all-null datasets during the window before pruning catches up.
 function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
     const { labels, datasets } = liveSessionRateChart.data;
 
@@ -422,8 +446,42 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
         }
     }
 
+    // Prune datasets that are entirely null across the whole window: the
+    // session has been gone long enough that no point in the visible range
+    // carries data. This keeps the internal arrays bounded on instances
+    // where sessions churn frequently. Indices are rebuilt from scratch.
+    pruneDepartedSessionDatasets();
+
     if (update) {
         liveSessionRateChart.update();
+    }
+}
+
+// pruneDepartedSessionDatasets removes datasets whose data array contains
+// only null/undefined values, and rebuilds sessionDatasetIndex to match
+// the new compacted indices. Called once per tick by updateSessionRateChart.
+function pruneDepartedSessionDatasets() {
+    const { datasets } = liveSessionRateChart.data;
+    let writeIdx = 0;
+    for (let readIdx = 0; readIdx < datasets.length; readIdx++) {
+        const ds = datasets[readIdx];
+        const hasData = ds.data.some(v => v !== null && v !== undefined);
+        if (!hasData) {
+            continue;
+        }
+        if (writeIdx !== readIdx) {
+            datasets[writeIdx] = ds;
+        }
+        writeIdx++;
+    }
+    if (writeIdx < datasets.length) {
+        datasets.length = writeIdx;
+        // Rebuild the index map so future lookups point at the compacted
+        // positions instead of the stale (pre-pruning) indices.
+        sessionDatasetIndex.clear();
+        for (let i = 0; i < datasets.length; i++) {
+            sessionDatasetIndex.set(datasets[i].label, i);
+        }
     }
 }
 
@@ -928,7 +986,7 @@ getStats();
                 const row = document.createElement("tr");
                 const cell = document.createElement("td");
                 cell.textContent = "No established sessions";
-                cell.colSpan = 5;
+                cell.colSpan = 6;
                 row.appendChild(cell);
                 fragment.appendChild(row);
             } else {
@@ -942,7 +1000,8 @@ getStats();
                         entry.RouterID,
                         entry.Hostname || "--",
                         toTimeElapsed(now - entry.EstablishTime),
-                        Number(entry.ImportCount).toLocaleString()
+                        Number(entry.ImportCount).toLocaleString(),
+                        formatSessionRate(entry.RateSec)
                     ];
 
                     cells.forEach((text) => {
@@ -957,6 +1016,8 @@ getStats();
             }
             const total = data.reduce((sum, entry) => sum + Number(entry.ImportCount || 0), 0);
             document.getElementById("totalImportCount").textContent = total.toLocaleString();
+            const totalRate = data.reduce((sum, entry) => sum + Number(entry.RateSec || 0), 0);
+            document.getElementById("totalSessionRate").textContent = formatSessionRate(totalRate);
 
             tbody.appendChild(fragment);
             loading.classList.add("d-none");
