@@ -250,10 +250,12 @@ const liveImportChart = new Chart(
     }
 );
 
-// --- Per-session BGP update rate chart (stacked) ---
-// Each established BGP session contributes one stacked dataset. The label
-// is the peer hostname when advertised, otherwise the peer IP. The chart
-// manages datasets dynamically as sessions come and go.
+// --- Per-session BGP update rate chart (100% stacked area) ---
+// Each established BGP session contributes one stacked area. The y-axis is
+// normalized to 0-100% so the chart shows each session's *share* of the
+// total update activity rather than the absolute rate. The raw per-second
+// rate is preserved in a parallel _rawData array on each dataset so the
+// tooltip can display both the percentage and the absolute value.
 const SESSION_CHART_MAX_POINTS = 51;
 // Deterministic color palette so the same label keeps the same color across
 // snapshots. Sized to cover the 20-session cap enforced by the backend.
@@ -327,19 +329,22 @@ const liveSessionRateChart = new Chart(
                 },
                 y: {
                     stacked: true,
-                    beginAtZero: true,
-                    suggestedMin: 0,
-                    suggestedMax: 10
+                    min: 0,
+                    max: 100,
+                    ticks: {
+                        // Render the y-axis as percentages so the chart reads
+                        // as a 100% stacked area, not a 0-100 count.
+                        callback: (value) => `${value}%`
+                    }
                 }
             },
             maintainAspectRatio: false,
             plugins: {
                 legend: {
                     display: true,
-                    position: "bottom",
-                    // Cap the legend height so 20+ sessions don't squeeze the
-                    // plot area. Chart.js scrolls the overflow internally.
-                    maxHeight: 80,
+                    // Match the other charts on the dashboard, which use the
+                    // Chart.js default legend position (top).
+                    position: "top",
                     labels: {
                         boxWidth: 12,
                         boxHeight: 12,
@@ -356,8 +361,28 @@ const liveSessionRateChart = new Chart(
                 },
                 tooltip: {
                     callbacks: {
-                        label: (ctx) => `${ctx.dataset.label}: ${(ctx.parsed.y).toFixed(2)}/sec`,
-                        footer: (items) => `Total: ${items.reduce((s, i) => s + i.parsed.y, 0).toFixed(2)}/sec`
+                        // Show both the percentage (from the normalized y value)
+                        // and the raw per-second rate (from _rawData) so the
+                        // viewer can read share and magnitude at once.
+                        label: (ctx) => {
+                            const pct = ctx.parsed.y.toFixed(1);
+                            const raw = ctx.dataset._rawData?.[ctx.dataIndex];
+                            const rateStr = (raw !== null && raw !== undefined)
+                                ? ` (${raw.toFixed(2)}/sec)`
+                                : "";
+                            return `${ctx.dataset.label}: ${pct}%${rateStr}`;
+                        },
+                        footer: (items) => {
+                            // Sum the raw rates for the hovered timestamp.
+                            let total = 0;
+                            for (const i of items) {
+                                const raw = i.dataset._rawData?.[i.dataIndex];
+                                if (raw !== null && raw !== undefined) {
+                                    total += raw;
+                                }
+                            }
+                            return `Total: ${total.toFixed(2)}/sec`;
+                        }
                     }
                 }
             }
@@ -371,25 +396,35 @@ const sessionDatasetIndex = new Map();
 
 // updateSessionRateChart ingests one ListSessions snapshot per stats tick.
 //
+// The chart is a 100% stacked area: each session's per-second rate is
+// normalized to its share of the total update activity at that tick, so
+// the stacked areas always sum to 100%. The raw per-second rate is kept
+// in a parallel _rawData array (one entry per label) so the tooltip can
+// show both the percentage and the absolute value.
+//
 // Design notes:
 // - New sessions are back-filled with null so Chart.js renders a gap rather
 //   than a fake zero-rate history (which would otherwise drag the stack
 //   baseline down for past ticks).
 // - Sessions that have left (not in this tick) get a null point so their
 //   stacked contribution disappears at the current timestamp.
+// - When the total rate for a tick is zero (no activity anywhere), every
+//   session gets 0% rather than NaN; this avoids a flat 100% spike on a
+//   single session from a 0/0 division.
 // - Departed datasets are pruned once they are entirely null (every point
-//   in the window is null) so the internal datasets array doesn't grow
-//   unbounded over a long-running session. The legend filter additionally
-//   hides all-null datasets during the window before pruning catches up.
+//   in the window is null) so the internal arrays don't grow unbounded.
 function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
     const { labels, datasets } = liveSessionRateChart.data;
 
-    // Slide window when full. Existing datasets already have a 1:1 alignment
-    // with labels so a single shift per dataset keeps them in sync.
+    // Slide window when full. Both data (percentages) and _rawData
+    // (absolute rates) must shift in lockstep so indices stay aligned.
     if (labels.length >= SESSION_CHART_MAX_POINTS) {
         labels.shift();
         for (const ds of datasets) {
             ds.data.shift();
+            if (ds._rawData) {
+                ds._rawData.shift();
+            }
         }
     }
 
@@ -398,10 +433,20 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
     const seenThisTick = new Set();
     const targetLength = labels.length;
 
+    // First pass: collect raw rates for this tick and compute the total so
+    // we can normalize to percentages. We can't normalize inline because we
+    // need the total across ALL sessions before writing any percentage.
+    const tickRates = new Map();
+    let tickTotal = 0;
     for (const session of sessions) {
-        const label = session.Label;
-        seenThisTick.add(label);
+        const rate = session.RateSec / dataIntervalSec;
+        tickRates.set(session.Label, rate);
+        tickTotal += rate;
+        seenThisTick.add(session.Label);
+    }
 
+    // Second pass: append a percentage point (or null) to each dataset.
+    for (const [label, rate] of tickRates) {
         let idx = sessionDatasetIndex.get(label);
         if (idx === undefined) {
             idx = datasets.length;
@@ -420,19 +465,25 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
                 pointBorderWidth: 1,
                 // Pad with nulls for past ticks where this session did not
                 // exist yet, so Chart.js renders gaps instead of flat zeros.
-                data: new Array(targetLength - 1).fill(null)
+                data: new Array(targetLength - 1).fill(null),
+                // _rawData mirrors data length 1:1 and holds the absolute
+                // per-second rate; consumed by the tooltip callback.
+                _rawData: new Array(targetLength - 1).fill(null)
             });
             sessionDatasetIndex.set(label, idx);
         }
 
         const ds = datasets[idx];
-        // Pad the dataset to the new length if it was created mid-window or
-        // if previous ticks were skipped (e.g. backend "others" bucket only
-        // appears once sessions exceed the cap).
+        // Pad to the new length if the dataset was created mid-window or
+        // if previous ticks were skipped (e.g. the backend "others" bucket
+        // only appears once sessions exceed the cap).
         while (ds.data.length < targetLength - 1) {
             ds.data.push(null);
+            ds._rawData.push(null);
         }
-        ds.data.push(session.RateSec / dataIntervalSec);
+        const pct = tickTotal > 0 ? (rate / tickTotal) * 100 : 0;
+        ds.data.push(pct);
+        ds._rawData.push(rate);
     }
 
     // Push null (skipped) for datasets not present in this tick so their
@@ -441,8 +492,10 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
         if (!seenThisTick.has(ds.label)) {
             while (ds.data.length < targetLength - 1) {
                 ds.data.push(null);
+                ds._rawData.push(null);
             }
             ds.data.push(null);
+            ds._rawData.push(null);
         }
     }
 
@@ -457,15 +510,17 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
     }
 }
 
-// pruneDepartedSessionDatasets removes datasets whose data array contains
-// only null/undefined values, and rebuilds sessionDatasetIndex to match
-// the new compacted indices. Called once per tick by updateSessionRateChart.
+// pruneDepartedSessionDatasets removes datasets whose _rawData array contains
+// only null/undefined values (meaning the session had no activity at any
+// visible point), and rebuilds sessionDatasetIndex to match the new
+// compacted indices. Called once per tick by updateSessionRateChart.
 function pruneDepartedSessionDatasets() {
     const { datasets } = liveSessionRateChart.data;
     let writeIdx = 0;
     for (let readIdx = 0; readIdx < datasets.length; readIdx++) {
         const ds = datasets[readIdx];
-        const hasData = ds.data.some(v => v !== null && v !== undefined);
+        const rawData = ds._rawData || ds.data;
+        const hasData = rawData.some(v => v !== null && v !== undefined);
         if (!hasData) {
             continue;
         }
