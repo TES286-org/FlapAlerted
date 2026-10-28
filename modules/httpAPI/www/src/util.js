@@ -53,3 +53,23 @@ export function truncateRouteChanges(routeChanges) {
     }
     return routeChanges;
 }
+
+// The collection interval (seconds) over which per-session path-change
+// counts are accumulated. Mirrors monitor.statisticsCollectionIntervalSec
+// on the backend. Kept here so the frontend can convert raw interval
+// counts into a per-second rate without an extra round-trip.
+export const STATS_COLLECTION_INTERVAL_SEC = 5;
+
+// formatSessionRate converts a raw per-interval path-change count into a
+// compact "N/s" display string. Returns "--" for missing/zero so the
+// sessions dialog and totals row stay readable when there is no activity.
+export function formatSessionRate(ratePerInterval) {
+    const n = Number(ratePerInterval);
+    if (!Number.isFinite(n) || n === 0) {
+        return "0/s";
+    }
+    const perSec = n / STATS_COLLECTION_INTERVAL_SEC;
+    // One decimal place is enough: the underlying counter is an integer
+    // count over 5s, so sub-decimal precision is meaningless beyond 0.1.
+    return `${perSec.toFixed(1)}/s`;
+}
