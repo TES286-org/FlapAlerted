@@ -17,7 +17,12 @@ type PrefixTable struct {
 	// by this session's table. It is swapped (atomically reset to zero) by
 	// the statistics collector every collection interval so that the per-
 	// session update rate can be derived independently for each peer.
-	pathChangeCount     atomic.Uint64
+	pathChangeCount atomic.Uint64
+	// lastIntervalCount holds the count returned by the most recent
+	// SwapPathChangeCount call. It allows non-destructive readers (e.g.
+	// the /sessions endpoint or Prometheus exporter) to report the latest
+	// interval's rate without consuming the live counter.
+	lastIntervalCount   atomic.Uint64
 	sessionCancellation context.CancelCauseFunc
 }
 
@@ -91,7 +96,18 @@ func (t *PrefixTable) ImportCount() uint32 {
 // SwapPathChangeCount atomically returns and resets the per-session path
 // change counter. Intended to be called once per statistics collection
 // interval by the monitor so that the returned delta reflects the number
-// of BGP update events produced by this session during that window.
+// of BGP update events produced by this session during that window. The
+// returned value is also stored in lastIntervalCount so that
+// non-destructive readers can observe the most recent interval's rate.
 func (t *PrefixTable) SwapPathChangeCount() uint64 {
-	return t.pathChangeCount.Swap(0)
+	v := t.pathChangeCount.Swap(0)
+	t.lastIntervalCount.Store(v)
+	return v
+}
+
+// LastIntervalCount returns the path-change count observed during the most
+// recent statistics collection interval, without consuming the live
+// counter. This is safe to call from HTTP request handlers.
+func (t *PrefixTable) LastIntervalCount() uint64 {
+	return t.lastIntervalCount.Load()
 }

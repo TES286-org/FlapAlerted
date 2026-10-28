@@ -70,3 +70,47 @@ func TestPrefixTable_SwapPathChangeCount(t *testing.T) {
 		<-pathChangeChan
 	}
 }
+
+// TestPrefixTable_LastIntervalCount verifies that LastIntervalCount returns
+// the value from the most recent Swap without consuming the live counter.
+// This is the contract relied on by HTTP handlers (/sessions, Prometheus)
+// that must not interfere with the statistics collector.
+func TestPrefixTable_LastIntervalCount(t *testing.T) {
+	pathChangeChan := make(chan PathChange, 100)
+	tbl := NewPrefixTable(pathChangeChan, nil)
+
+	// Before any swap, the last-interval snapshot is zero.
+	if got := tbl.LastIntervalCount(); got != 0 {
+		t.Fatalf("expected 0 before first swap, got %d", got)
+	}
+
+	// Produce two path changes and swap once.
+	tbl.update(testPrefixV4("10.0.0.0/24"), 1, false, testAsPath(1))
+	tbl.update(testPrefixV4("10.0.0.0/24"), 1, false, testAsPath(2))
+	tbl.update(testPrefixV4("10.0.0.0/24"), 1, false, testAsPath(3))
+	swapped := tbl.SwapPathChangeCount()
+	if swapped != 2 {
+		t.Fatalf("expected 2 from swap, got %d", swapped)
+	}
+
+	// LastIntervalCount must mirror the swapped value without resetting.
+	if got := tbl.LastIntervalCount(); got != 2 {
+		t.Fatalf("expected LastIntervalCount=2, got %d", got)
+	}
+
+	// Repeated non-destructive reads must be stable.
+	if got := tbl.LastIntervalCount(); got != 2 {
+		t.Fatalf("expected stable LastIntervalCount=2, got %d", got)
+	}
+
+	// A new swap with no activity since must report 0 but preserve the
+	// previous interval's snapshot until the next swap overwrites it.
+	tbl.SwapPathChangeCount()
+	if got := tbl.LastIntervalCount(); got != 0 {
+		t.Fatalf("expected LastIntervalCount=0 after empty swap, got %d", got)
+	}
+
+	for len(pathChangeChan) > 0 {
+		<-pathChangeChan
+	}
+}

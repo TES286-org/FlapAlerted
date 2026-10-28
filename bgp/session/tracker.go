@@ -31,6 +31,28 @@ type SessionRate struct {
 	RateSec int    `json:"RateSec"`
 }
 
+// SessionInfo captures the display-relevant fields of an established BGP
+// session. It is the structured equivalent of the JSONInfo type previously
+// inlined in GetSessionInfoJson, factored out so that other callers (e.g.
+// the Prometheus exporter, the /sessions endpoint) can consume the same
+// data without re-marshalling.
+type SessionInfo struct {
+	Remote   string
+	RouterID string
+	Hostname string
+	// Label is the display label resolved via the same rules as the
+	// per-session rate chart: hostname when advertised, otherwise the
+	// peer IP (port stripped). Exposed so external consumers (Prometheus,
+	// sessions dialog) don't have to re-implement the fallback logic.
+	Label         string
+	EstablishTime int64
+	ImportCount   uint32
+	// RateSec is the path-change count observed during the most recent
+	// statistics collection interval (non-destructive read). Dividing by
+	// the collection interval (5s) yields the per-second rate.
+	RateSec uint64
+}
+
 func AddSession(conn net.Conn, session *common.LocalSession, table *table.PrefixTable) {
 	newSession := establishedSession{
 		Remote:        conn.RemoteAddr().String(),
@@ -104,27 +126,39 @@ func sessionLabel(s establishedSession) string {
 func GetSessionInfoJson() (string, error) {
 	sessionTrackerLock.RLock()
 	defer sessionTrackerLock.RUnlock()
-	type JSONInfo struct {
-		Remote        string
-		RouterID      string
-		Hostname      string
-		EstablishTime int64
-		ImportCount   uint32
-	}
 
-	var sessions = make([]JSONInfo, 0)
-	for _, session := range sessionTracker {
-		sessions = append(sessions, JSONInfo{
-			Remote:        session.Remote,
-			RouterID:      session.session.RemoteRouterID.String(),
-			Hostname:      session.session.RemoteHostname,
-			EstablishTime: session.EstablishTime,
-			ImportCount:   session.table.ImportCount(),
-		})
-	}
-	result, err := json.Marshal(sessions)
+	infos := GetSessionInfosLocked()
+	result, err := json.Marshal(infos)
 	if err != nil {
 		return "", err
 	}
 	return string(result), nil
+}
+
+// GetSessionInfos returns a snapshot of all established sessions including
+// the most recent interval's path-change rate. Safe to call from HTTP
+// request handlers; does not consume the live counter.
+func GetSessionInfos() []SessionInfo {
+	sessionTrackerLock.RLock()
+	defer sessionTrackerLock.RUnlock()
+	return GetSessionInfosLocked()
+}
+
+// GetSessionInfosLocked is the lock-free inner helper. Callers must hold
+// sessionTrackerLock (read or write). Factored out so that GetSessionInfoJson
+// and GetSessionInfos share a single implementation.
+func GetSessionInfosLocked() []SessionInfo {
+	infos := make([]SessionInfo, 0, len(sessionTracker))
+	for _, s := range sessionTracker {
+		infos = append(infos, SessionInfo{
+			Remote:        s.Remote,
+			RouterID:      s.session.RemoteRouterID.String(),
+			Hostname:      s.session.RemoteHostname,
+			Label:         sessionLabel(s),
+			EstablishTime: s.EstablishTime,
+			ImportCount:   s.table.ImportCount(),
+			RateSec:       s.table.LastIntervalCount(),
+		})
+	}
+	return infos
 }
