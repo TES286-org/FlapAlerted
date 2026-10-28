@@ -4,6 +4,7 @@ package httpAPI
 
 import (
 	"FlapAlerted/analyze"
+	"FlapAlerted/bgp/session"
 	"FlapAlerted/monitor"
 	"fmt"
 	"net/http"
@@ -82,4 +83,38 @@ func prometheusActivePeerRates(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
+
+	// Per-session metrics: one series per established BGP connection,
+	// labeled with the peer hostname (when advertised) or the peer IP.
+	// The rate reflects the most recent statistics collection interval
+	// and is read non-destructively so it does not interfere with the
+	// live counter consumed by the SSE stream.
+	sessionInfos := session.GetSessionInfos()
+
+	_, _ = fmt.Fprintln(w, "# HELP bgp_session_updates_per_interval BGP update count during the last collection interval for each session")
+	_, _ = fmt.Fprintln(w, "# TYPE bgp_session_updates_per_interval gauge")
+
+	_, _ = fmt.Fprintln(w, "# HELP bgp_session_imported_routes Number of imported routes for each session")
+	_, _ = fmt.Fprintln(w, "# TYPE bgp_session_imported_routes gauge")
+
+	for _, s := range sessionInfos {
+		label := prometheusQuoteLabel(s.Label)
+		if _, err := fmt.Fprintf(
+			w, "bgp_session_updates_per_interval{label=%s} %d\n", label, s.RateSec,
+		); err != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(
+			w, "bgp_session_imported_routes{label=%s} %d\n", label, s.ImportCount,
+		); err != nil {
+			return
+		}
+	}
+}
+
+// prometheusQuoteLabel escapes and quotes a label value per the Prometheus
+// exposition format (backslash, double-quote, newline are escaped). Go's %q
+// verb produces exactly this escaping, so we delegate to fmt.Sprintf.
+func prometheusQuoteLabel(value string) string {
+	return fmt.Sprintf("%q", value)
 }
