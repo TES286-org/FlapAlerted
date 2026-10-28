@@ -10,9 +10,14 @@ import (
 )
 
 type PrefixTable struct {
-	table               map[netip.Prefix]*Entry
-	pathChangeChan      chan PathChange
-	importCount         atomic.Uint32
+	table          map[netip.Prefix]*Entry
+	pathChangeChan chan PathChange
+	importCount    atomic.Uint32
+	// pathChangeCount tracks the total number of PathChange events emitted
+	// by this session's table. It is swapped (atomically reset to zero) by
+	// the statistics collector every collection interval so that the per-
+	// session update rate can be derived independently for each peer.
+	pathChangeCount     atomic.Uint64
 	sessionCancellation context.CancelCauseFunc
 }
 
@@ -40,6 +45,7 @@ func (t *PrefixTable) update(prefix netip.Prefix, pathID uint32, isWithdrawal bo
 					IsWithdrawal: true,
 					OldPath:      oldPath,
 				}
+				t.pathChangeCount.Add(1)
 				t.importCount.Add(^uint32(0))
 				delete(entry.Paths, pathID)
 				if len(entry.Paths) == 0 {
@@ -65,6 +71,7 @@ func (t *PrefixTable) update(prefix netip.Prefix, pathID uint32, isWithdrawal bo
 					IsSamePath:   asPath.Equals(oldPath),
 					OldPath:      oldPath,
 				}
+				t.pathChangeCount.Add(1)
 			} else {
 				if t.importCount.Add(1) > config.GlobalConf.ImportLimit {
 					t.importCount.Add(^uint32(0))
@@ -79,4 +86,12 @@ func (t *PrefixTable) update(prefix netip.Prefix, pathID uint32, isWithdrawal bo
 
 func (t *PrefixTable) ImportCount() uint32 {
 	return t.importCount.Load()
+}
+
+// SwapPathChangeCount atomically returns and resets the per-session path
+// change counter. Intended to be called once per statistics collection
+// interval by the monitor so that the returned delta reflects the number
+// of BGP update events produced by this session during that window.
+func (t *PrefixTable) SwapPathChangeCount() uint64 {
+	return t.pathChangeCount.Swap(0)
 }
