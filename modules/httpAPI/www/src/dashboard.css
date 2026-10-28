@@ -282,6 +282,30 @@ dialog[open]::backdrop {
     color: red;
 }
 
+/* Auto-refresh control row at the bottom of the sessions dialog */
+.sessionsDialog-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 1em;
+}
+
+#sessionsAutoRefreshLabel {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-weight: 500;
+    user-select: none;
+}
+
+#sessionsAutoRefreshLabel input[type="checkbox"] {
+    cursor: pointer;
+    width: 18px;
+    height: 18px;
+}
+
 /* Controls Section - separated styling */
 .controls-section {
     border-top: 1px solid #e2e8f0;

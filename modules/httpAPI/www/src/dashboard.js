@@ -1059,19 +1059,76 @@ getStats();
     const table = document.getElementById("sessionsTable");
     const tbody = document.getElementById("sessionsTableBody");
     const error = document.getElementById("sessionsError");
+    const autoRefreshCheckbox = document.getElementById("sessionsAutoRefreshCheckbox");
+
+    // Persist the user's auto-refresh preference across dialog reopens so a
+    // one-time enablement stays active the next time the dialog is opened.
+    const autoRefreshPrefKey = "fa_sessionsAutoRefresh";
+    let autoRefreshEnabled = localStorage.getItem(autoRefreshPrefKey) === "true";
+    autoRefreshCheckbox.checked = autoRefreshEnabled;
+
+    // The interval aligns with the backend statistics collection cadence
+    // (5s), so each refresh reflects a fresh interval's worth of data.
+    const AUTO_REFRESH_INTERVAL_MS = 5000;
+    let autoRefreshTimer = null;
 
     document.getElementById("closeSessionsDialog")?.addEventListener("click", () => {
         dialog.close();
     });
 
+    autoRefreshCheckbox.addEventListener("change", () => {
+        autoRefreshEnabled = autoRefreshCheckbox.checked;
+        localStorage.setItem(autoRefreshPrefKey, autoRefreshEnabled.toString());
+        // Apply immediately: start or stop the timer based on the new state
+        // and the dialog being currently open.
+        syncAutoRefreshTimer();
+    });
+
+    // syncAutoRefreshTimer ensures the periodic fetch timer is running if and
+    // only if auto-refresh is enabled AND the dialog is currently open. This
+    // avoids polling in the background when the dialog has been dismissed.
+    function syncAutoRefreshTimer() {
+        const shouldRun = autoRefreshEnabled && dialog.open;
+        if (shouldRun && autoRefreshTimer === null) {
+            autoRefreshTimer = setInterval(loadSessions, AUTO_REFRESH_INTERVAL_MS);
+        } else if (!shouldRun && autoRefreshTimer !== null) {
+            clearInterval(autoRefreshTimer);
+            autoRefreshTimer = null;
+        }
+    }
+
+    // Stop the timer when the dialog is closed via any means (Close button,
+    // Esc key, backdrop click). The 'close' event fires for all of these.
+    dialog.addEventListener("close", syncAutoRefreshTimer);
+
     document.getElementById("sessionCountLink").onclick = async (ev) => {
         ev.preventDefault();
+        // Reset the table to a loading state for the initial fetch. On
+        // auto-refresh ticks, loadSessions preserves the existing rows
+        // until the new data arrives (no flash of empty content).
+        tbody.replaceChildren();
+        error.classList.add("d-none");
         loading.classList.remove("d-none");
         table.classList.add("d-none");
-        error.classList.add("d-none");
-        tbody.innerHTML = "";
 
         dialog.showModal();
+
+        await loadSessions();
+        syncAutoRefreshTimer();
+    };
+
+    async function loadSessions() {
+        // Suppress the full-screen spinner on auto-refresh ticks: the table is
+        // already visible and a flashing spinner every 5s would be jarring.
+        // Errors on auto-refresh are surfaced inline via the error element
+        // rather than throwing, so a transient network blip doesn't clear the
+        // table.
+        const isInitialLoad = tbody.children.length === 0;
+
+        if (isInitialLoad) {
+            loading.classList.remove("d-none");
+            table.classList.add("d-none");
+        }
 
         try {
             const response = await fetch("sessions", getFetchOptions());
@@ -1118,15 +1175,20 @@ getStats();
             const totalRate = data.reduce((sum, entry) => sum + Number(entry.RateSec || 0), 0);
             document.getElementById("totalSessionRate").textContent = formatSessionRate(totalRate);
 
-            tbody.appendChild(fragment);
+            tbody.replaceChildren(fragment);
             loading.classList.add("d-none");
             table.classList.remove("d-none");
+            // Clear any previous error once a fresh fetch succeeds.
+            error.textContent = "";
+            error.classList.add("d-none");
         } catch (err) {
-            loading.classList.add("d-none");
+            if (isInitialLoad) {
+                loading.classList.add("d-none");
+            }
             error.textContent = `Error loading sessions: ${err.message}`;
             error.classList.remove("d-none");
         }
-    };
+    }
 }
 
 const historicalDialogOpenBtn = document.getElementById('viewHistoricalEvents');

@@ -148,7 +148,13 @@
             </tfoot>
         </table>
     </div>
-    <p id="sessionsError" class="SessionsDialog-error"></p>
+    <div class="sessionsDialog-controls">
+        <label id="sessionsAutoRefreshLabel">
+            <input type="checkbox" id="sessionsAutoRefreshCheckbox">
+            Auto-refresh every 5s
+        </label>
+        <p id="sessionsError" class="SessionsDialog-error"></p>
+    </div>
 </dialog>
 <dialog id="historicalDialog">
     <button id="closeHistoricalDialog" class="styled-btn square float-right">Close</button>
