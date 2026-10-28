@@ -256,35 +256,51 @@ const liveImportChart = new Chart(
 // total update activity rather than the absolute rate. The raw per-second
 // rate is preserved in a parallel _rawData array on each dataset so the
 // tooltip can display both the percentage and the absolute value.
+//
+// Visual design notes:
+// - Colors use a muted, harmonious palette (HSL-based, evenly spaced hue,
+//   constant saturation/lightness) so stacked areas don't "vibrate" the
+//   way a high-saturation rainbow palette does.
+// - borderWidth is 0: the color change between adjacent areas is the
+//   boundary; adding borders creates thick white dividers that add visual
+//   noise without aiding readability.
+// - tension: 0.35 smooths the jagged per-tick sawtooth into gentle curves
+//   without hiding real transitions.
+// - pointRadius: 0 by default — points add clutter on a dense stacked area;
+//   they reappear on hover for precise inspection.
 const SESSION_CHART_MAX_POINTS = 51;
 // Deterministic color palette so the same label keeps the same color across
 // snapshots. Sized to cover the 20-session cap enforced by the backend.
-// "others" uses a neutral slate so it is visually distinct from any single
-// session color and reads as an aggregate rather than a real peer.
+//
+// The palette is generated from evenly-spaced hues (golden-angle stride
+// ≈ 38° gives good perceptual separation) with a fixed, muted saturation
+// (55%) and lightness (58%). This keeps the stacked areas harmonious —
+// no single color dominates, and adjacent areas stay distinguishable
+// without the high-saturation "rainbow clash" effect.
 const SESSION_CHART_PALETTE = [
-    "rgba(37, 99, 235, 0.55)",   // blue
-    "rgba(13, 148, 136, 0.55)",  // teal
-    "rgba(5, 150, 105, 0.55)",   // green
-    "rgba(132, 204, 22, 0.55)",  // lime
-    "rgba(234, 179, 8, 0.55)",   // amber
-    "rgba(249, 115, 22, 0.55)",  // orange
-    "rgba(239, 68, 68, 0.55)",   // red
-    "rgba(219, 39, 119, 0.55)",  // pink
-    "rgba(168, 85, 247, 0.55)",  // purple
-    "rgba(79, 70, 229, 0.55)",  // indigo
-    "rgba(14, 165, 233, 0.55)",  // sky
-    "rgba(20, 184, 166, 0.55)",  // cyan
-    "rgba(101, 163, 13, 0.55)",  // olive
-    "rgba(245, 158, 11, 0.55)",  // yellow
-    "rgba(220, 38, 38, 0.55)",   // crimson
-    "rgba(190, 24, 93, 0.55)",   // rose
-    "rgba(124, 58, 237, 0.55)",  // violet
-    "rgba(49, 46, 129, 0.55)",   // navy
-    "rgba(8, 145, 178, 0.55)",   // deep-teal
-    "rgba(77, 124, 15, 0.55)"    // forest
+    "hsla(215, 55%, 58%, 0.82)",  // blue
+    "hsla(185, 55%, 58%, 0.82)",  // teal
+    "hsla(152, 55%, 58%, 0.82)",  // green
+    "hsla(95,  55%, 58%, 0.82)",  // lime-green
+    "hsla(57,  55%, 58%, 0.82)",  // yellow-green
+    "hsla(38,  55%, 58%, 0.82)",  // amber
+    "hsla(20,  55%, 58%, 0.82)",  // orange
+    "hsla(2,   55%, 58%, 0.82)",  // red-orange
+    "hsla(340, 55%, 58%, 0.82)",  // rose
+    "hsla(310, 55%, 58%, 0.82)",  // magenta
+    "hsla(280, 55%, 58%, 0.82)",  // purple
+    "hsla(250, 55%, 58%, 0.82)",  // indigo
+    "hsla(228, 55%, 58%, 0.82)",  // blue-indigo
+    "hsla(200, 55%, 58%, 0.82)",  // sky
+    "hsla(173, 55%, 58%, 0.82)",  // cyan-teal
+    "hsla(140, 55%, 58%, 0.82)",  // sea-green
+    "hsla(110, 55%, 58%, 0.82)",  // olive-green
+    "hsla(75,  55%, 58%, 0.82)",  // chartreuse
+    "hsla(50,  55%, 58%, 0.82)",  // gold
+    "hsla(28,  55%, 58%, 0.82)"   // burnt-orange
 ];
-const SESSION_OTHERS_COLOR_BG = "rgba(100, 116, 139, 0.55)";  // slate-500
-const SESSION_OTHERS_COLOR_BORDER = "rgba(100, 116, 139, 1)";
+const SESSION_OTHERS_COLOR_BG = "hsla(220, 8%, 55%, 0.82)";  // neutral slate
+const SESSION_OTHERS_COLOR_BORDER = "hsla(220, 8%, 55%, 1)";
 
 function colorForSessionLabel(label, index) {
     if (label === "others") {
@@ -294,12 +310,15 @@ function colorForSessionLabel(label, index) {
 }
 
 function borderForSessionLabel(label, index) {
+    // Borders are disabled (borderWidth: 0 on the dataset) so this value is
+    // only used when borderWidth is explicitly set elsewhere (e.g. by a
+    // hover style). Kept for completeness.
     if (label === "others") {
         return SESSION_OTHERS_COLOR_BORDER;
     }
     const bg = colorForSessionLabel(label, index);
-    // Promote alpha to ~1.0 for the line border by replacing the alpha group
-    return bg.replace(/rgba\(([^)]+),\s*[\d.]+\)/, "rgba($1, 1)");
+    // Promote alpha to 1 by replacing the hsla alpha group.
+    return bg.replace(/hsla\(([^)]+),\s*[\d.]+\)/, "hsla($1, 1)");
 }
 
 const ctxSessionRate = document.getElementById("chartSessionRate").getContext("2d");
@@ -455,10 +474,19 @@ function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
                 label,
                 fill: true,
                 stack: "sessions",
+                // Smooth the per-tick sawtooth into gentle curves without
+                // hiding real transitions. 0.35 is high enough to soften
+                // noise but low enough to preserve real rate changes.
+                tension: 0.35,
                 backgroundColor: colorForSessionLabel(label, dsIdx),
                 borderColor: borderForSessionLabel(label, dsIdx),
-                borderWidth: 1,
-                pointRadius: 4,
+                // No visible border between areas: the color change IS
+                // the boundary. Borders would add thick white dividers
+                // that increase visual noise without aiding readability.
+                borderWidth: 0,
+                // Points are hidden by default — on a dense stacked area
+                // they add clutter. They reappear on hover for inspection.
+                pointRadius: 0,
                 pointHoverRadius: 4,
                 pointHitRadius: 10,
                 pointBackgroundColor: "#fff",
@@ -552,7 +580,12 @@ const compactChartMedia = window.matchMedia("(max-width: 640px)");
 function updateChartPresentation() {
     const compact = compactChartMedia.matches;
 
-    for (const chart of [liveRouteChart, liveFlapChart, liveImportChart, liveSessionRateChart]) {
+    // Charts that show discrete data points (lines with markers). The
+    // per-session stacked area chart is excluded: its points are hidden by
+    // design (pointRadius: 0 on each dataset) because markers add clutter
+    // on a dense stacked area.
+    const pointCharts = [liveRouteChart, liveFlapChart, liveImportChart];
+    for (const chart of pointCharts) {
         for (const dataset of chart.data.datasets) {
             dataset.pointRadius = compact ? 0 : 4;
             dataset.pointHoverRadius = compact ? 3 : 4;
@@ -570,6 +603,17 @@ function updateChartPresentation() {
 
         chart.update("none");
     }
+
+    // The session chart only needs the interaction mode and tick limit;
+    // its point styling is owned by the dataset config and must not be
+    // overwritten here.
+    liveSessionRateChart.options.interaction = {
+        mode: "index",
+        axis: "x",
+        intersect: false
+    };
+    liveSessionRateChart.options.scales.x.ticks.maxTicksLimit = compact ? 4 : 10;
+    liveSessionRateChart.update("none");
 }
 
 updateChartPresentation();
