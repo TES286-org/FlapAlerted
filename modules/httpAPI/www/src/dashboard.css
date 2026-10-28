@@ -115,7 +115,7 @@ dialog[open]::backdrop {
 #grid-container-charts {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: repeat(3, 15em);
+    grid-template-rows: repeat(4, 15em);
     gap: 10px;
 }
 

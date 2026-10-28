@@ -250,12 +250,196 @@ const liveImportChart = new Chart(
     }
 );
 
+// --- Per-session BGP update rate chart (stacked) ---
+// Each established BGP session contributes one stacked dataset. The label
+// is the peer hostname when advertised, otherwise the peer IP. The chart
+// manages datasets dynamically as sessions come and go.
+const SESSION_CHART_MAX_POINTS = 51;
+// Deterministic color palette so the same label keeps the same color across
+// snapshots. Sized generously to cover the max-session cap enforced by the
+// backend plus headroom for the "others" bucket.
+const SESSION_CHART_PALETTE = [
+    "rgba(37, 99, 235, 0.55)",   // blue
+    "rgba(13, 148, 136, 0.55)",  // teal
+    "rgba(5, 150, 105, 0.55)",   // green
+    "rgba(132, 204, 22, 0.55)",  // lime
+    "rgba(234, 179, 8, 0.55)",   // amber
+    "rgba(249, 115, 22, 0.55)",  // orange
+    "rgba(239, 68, 68, 0.55)",   // red
+    "rgba(219, 39, 119, 0.55)",  // pink
+    "rgba(168, 85, 247, 0.55)",  // purple
+    "rgba(79, 70, 229, 0.55)",   // indigo
+    "rgba(14, 165, 233, 0.55)",  // sky
+    "rgba(20, 184, 166, 0.55)",  // cyan
+    "rgba(101, 163, 13, 0.55)",  // olive
+    "rgba(245, 158, 11, 0.55)",  // yellow
+    "rgba(220, 38, 38, 0.55)",   // crimson
+    "rgba(190, 24, 93, 0.55)",   // rose
+    "rgba(124, 58, 237, 0.55)",  // violet
+    "rgba(49, 46, 129, 0.55)",   // navy
+    "rgba(8, 145, 178, 0.55)",   // deep-teal
+    "rgba(77, 124, 15, 0.55)",   // forest
+    "rgba(120, 53, 15, 0.55)"    // brown (used for "others")
+];
+
+function colorForSessionLabel(label, index) {
+    if (label === "others") {
+        return "rgba(120, 53, 15, 0.55)";
+    }
+    return SESSION_CHART_PALETTE[index % SESSION_CHART_PALETTE.length];
+}
+
+function borderForSessionLabel(label, index) {
+    const bg = colorForSessionLabel(label, index);
+    // Promote alpha to ~1.0 for the line border by replacing the alpha group
+    return bg.replace(/rgba\(([^)]+),\s*[\d.]+\)/, "rgba($1, 1)");
+}
+
+const ctxSessionRate = document.getElementById("chartSessionRate").getContext("2d");
+
+const liveSessionRateChart = new Chart(
+    ctxSessionRate,
+    {
+        type: "line",
+        data: {
+            labels: [],
+            datasets: []
+        },
+        options: {
+            interaction: {
+                mode: "index",
+                axis: "x",
+                intersect: false
+            },
+            scales: {
+                x: {
+                    type: "time",
+                    time: {
+                        unit: "minute",
+                        displayFormats: { minute: "HH:mm" },
+                        tooltipFormat: "HH:mm:ss"
+                    }
+                },
+                y: {
+                    stacked: true,
+                    beginAtZero: true,
+                    suggestedMin: 0,
+                    suggestedMax: 10
+                }
+            },
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: true,
+                    position: "bottom",
+                    labels: {
+                        boxWidth: 12,
+                        boxHeight: 12,
+                        font: { size: 10 }
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => `${ctx.dataset.label}: ${(ctx.parsed.y).toFixed(2)}/sec`,
+                        footer: (items) => `Total: ${items.reduce((s, i) => s + i.parsed.y, 0).toFixed(2)}/sec`
+                    }
+                }
+            }
+        }
+    }
+);
+
+// Map from session label to its dataset index in the chart. Allows O(1)
+// lookup when updating values across stats ticks.
+const sessionDatasetIndex = new Map();
+
+// Update the per-session rate chart from a ListSessions snapshot. The chart
+// keeps 51 points (matching the other live charts) and prunes datasets whose
+// session has not been seen for the entire window so the legend does not
+// accumulate stale entries forever.
+function updateSessionRateChart(sessions, unixTime, dataIntervalSec, update) {
+    const { labels, datasets } = liveSessionRateChart.data;
+
+    // Slide window when full. Existing datasets already have a 1:1 alignment
+    // with labels so a single shift per dataset keeps them in sync.
+    if (labels.length >= SESSION_CHART_MAX_POINTS) {
+        labels.shift();
+        for (const ds of datasets) {
+            ds.data.shift();
+        }
+    }
+
+    labels.push(unixTime * 1000);
+
+    const seenThisTick = new Set();
+    const targetLength = labels.length;
+
+    for (const session of sessions) {
+        const label = session.Label;
+        seenThisTick.add(label);
+
+        let idx = sessionDatasetIndex.get(label);
+        if (idx === undefined) {
+            idx = datasets.length;
+            const dsIdx = idx;
+            datasets.push({
+                label,
+                fill: true,
+                stack: "sessions",
+                backgroundColor: colorForSessionLabel(label, dsIdx),
+                borderColor: borderForSessionLabel(label, dsIdx),
+                borderWidth: 1,
+                pointRadius: 4,
+                pointHoverRadius: 4,
+                pointHitRadius: 10,
+                pointBackgroundColor: "#fff",
+                pointBorderWidth: 1,
+                // Pad with nulls for past ticks where this session did not
+                // exist yet, so Chart.js renders gaps instead of flat zeros.
+                data: new Array(targetLength - 1).fill(null)
+            });
+            sessionDatasetIndex.set(label, idx);
+        }
+
+        const ds = datasets[idx];
+        // Pad the dataset to the new length if it was created mid-window or
+        // if previous ticks were skipped (e.g. backend "others" bucket only
+        // appears once sessions exceed the cap).
+        while (ds.data.length < targetLength - 1) {
+            ds.data.push(null);
+        }
+        ds.data.push(session.RateSec / dataIntervalSec);
+    }
+
+    // Push null (skipped) for datasets not present in this tick so their
+    // stacked contribution disappears for the current point.
+    for (const ds of datasets) {
+        if (!seenThisTick.has(ds.label)) {
+            while (ds.data.length < targetLength - 1) {
+                ds.data.push(null);
+            }
+            ds.data.push(null);
+        }
+    }
+
+    if (update) {
+        liveSessionRateChart.update();
+    }
+}
+
+function resetSessionRateChart() {
+    liveSessionRateChart.data.labels = [];
+    liveSessionRateChart.data.datasets = [];
+    sessionDatasetIndex.clear();
+    liveSessionRateChart.update("none");
+}
+
 const compactChartMedia = window.matchMedia("(max-width: 640px)");
 
 function updateChartPresentation() {
     const compact = compactChartMedia.matches;
 
-    for (const chart of [liveRouteChart, liveFlapChart, liveImportChart]) {
+    for (const chart of [liveRouteChart, liveFlapChart, liveImportChart, liveSessionRateChart]) {
         for (const dataset of chart.data.datasets) {
             dataset.pointRadius = compact ? 0 : 4;
             dataset.pointHoverRadius = compact ? 3 : 4;
@@ -608,6 +792,7 @@ function getStats() {
         liveRouteChart.update('none');
         liveFlapChart.update('none');
         liveImportChart.update('none');
+        liveSessionRateChart.update('none');
     });
     evtSource.addEventListener("c", (event) => {
         dataUpdate(event, false);
@@ -627,6 +812,7 @@ function getStats() {
 
             const flapList = js["List"];
             const peerList = js["ListPeers"];
+            const sessionList = js["ListSessions"];
             const sessionCount = js["Sessions"];
             if (sessionCount !== -1) {
                 sessionCountElem.innerText = sessionCount;
@@ -645,6 +831,7 @@ function getStats() {
 
             updateList(flapList);
             updatePeers(peerList);
+            updateSessionRateChart(sessionList || [], stats["Time"], dataIntervalSec, update);
 
             addToChart(
                 liveRouteChart,
@@ -691,6 +878,7 @@ function getStats() {
             d.labels = [];
             d.datasets.forEach(ds => ds.data = []);
         });
+        resetSessionRateChart();
         avgArray.length = 0;
         lastSeenTime = 0;
         handleConnectionLost(false);
